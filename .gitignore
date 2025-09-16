@@ -1,0 +1,28 @@
+# Node.js dependencies
+node_modules/
+
+# Python virtual environments
+.venv/
+env/
+venv/
+
+# VS Code settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Data/output folders (customize as needed)
+data/
+output/
+*.log
+
+# Secrets (customize as needed)
+*.env
+.env.*
+secrets/

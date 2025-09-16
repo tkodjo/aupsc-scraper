@@ -1,0 +1,9 @@
+requests>=2.32
+beautifulsoup4>=4.12
+lxml>=5.2
+tqdm>=4.66
+pandas>=2.2
+matplotlib>=3.9
+nltk>=3.9
+scikit-learn>=1.5
+PyMuPDF>=1.24
