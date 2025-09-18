@@ -1,398 +1,519 @@
-# au_analyze.py
-import os, re, argparse
+# analyze.py — AU/PSC document analysis pipeline
+# - Reads data/manifest.csv (from au_scrape.py)
+# - Extracts PDF text (per-page via PyMuPDF, pdfminer fallback)
+# - Heuristic doc_type
+# - Multi-country extraction (ignores PDF page 1 by default) + region mapping
+# - Topic tagging (country preferred; else thematic/organs/instruments/RECs)
+# - Sentiment (VADER)
+# - 4-level Diplomatic Intent
+# - Saves data/analysis.csv + charts in output/charts/
+# - Optional colors via chart_colors.json
+
+import os, re, argparse, json, unicodedata, datetime
 import pandas as pd
-import fitz  # PyMuPDF
-from tqdm import tqdm
-import nltk
-from nltk.sentiment import SentimentIntensityAnalyzer
 import matplotlib.pyplot as plt
 
-# One-time VADER lexicon
-nltk.download('vader_lexicon', quiet=True)
+# ---------------- FS helpers ----------------
+def ensure_dir(p):
+    if p:
+        os.makedirs(p, exist_ok=True)
 
-# ---------- Utilities ----------
-def pdf_to_text(path:str) -> str:
-    text_parts = []
-    with fitz.open(path) as doc:
-        for page in doc:
-            text_parts.append(page.get_text())
-    return "\n".join(text_parts)
+# ---------------- Colors ----------------
+def load_colors(path):
+    if not path:
+        return {}
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        for k in ("tone","intent","verbs","regions","doc_types","topics","crises"):
+            if k in cfg and not isinstance(cfg[k], dict):
+                cfg[k] = {}
+        if "palette" not in cfg or not isinstance(cfg["palette"], list):
+            cfg["palette"] = []
+        return cfg
+    except Exception as e:
+        print(f"[WARN] Colors not loaded ({e}).")
+        return {"palette": []}
 
-def ensure_dir(path:str):
-    os.makedirs(path, exist_ok=True)
+def _color_list(labels, cmap, palette):
+    if not labels:
+        return None
+    out = []
+    for i, lbl in enumerate(labels):
+        c = (cmap or {}).get(lbl)
+        if not c and palette:
+            c = palette[i % len(palette)]
+        out.append(c)
+    return out if any(out) else None
 
-def bar_save(series_or_df, title, xlabel, ylabel, out_path, stacked=False):
-    plt.figure()
-    if hasattr(series_or_df, "plot"):
-        series_or_df.plot(kind="bar", stacked=stacked)
-    else:
-        plt.bar(range(len(series_or_df)), series_or_df)
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel(ylabel)
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=160)
-    plt.close()
+# ---------------- PDF text extraction ----------------
+def extract_text_pages(path):
+    """Return list of page texts; prefer PyMuPDF; fallback to pdfminer (split by form feed)."""
+    # Primary: PyMuPDF
+    try:
+        import fitz  # PyMuPDF
+        pages = []
+        with fitz.open(path) as doc:
+            for page in doc:
+                pages.append(page.get_text())
+        return pages if pages else [""]
+    except Exception:
+        pass
+    # Fallback: pdfminer.six
+    try:
+        from pdfminer.high_level import extract_text
+        full = extract_text(path) or ""
+        parts = [p.strip() for p in re.split(r"\f+", full) if p.strip()]
+        return parts if parts else [full]
+    except Exception:
+        return [""]
 
-def hist_save(series, bins, title, xlabel, out_path):
-    plt.figure()
-    plt.hist(series.dropna(), bins=bins)
-    plt.title(title)
-    plt.xlabel(xlabel)
-    plt.ylabel("Count")
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=160)
-    plt.close()
+# ---------------- Normalization ----------------
+def _norm(s: str) -> str:
+    if not isinstance(s, str):
+        return ""
+    s = unicodedata.normalize("NFKD", s)
+    s = "".join(ch for ch in s if not unicodedata.combining(ch))
+    return s.lower()
 
-# ---------- Classification helpers ----------
-def classify_type(title:str, filename:str, text:str) -> str:
-    t = f"{title} {filename} {text[:4000]}".lower()
-    if "press statement" in t or "press release" in t:
-        return "Press Statement"
-    if "communiqué" in t or "communique" in t or ".comm" in filename.lower():
-        return "Communiqué"
-    if "report of the chairperson" in t or re.search(r"\breport\b", t):
-        return "Report"
-    if "decision" in t or "declaration" in t or "resolution" in t:
-        return "Decision/Declaration"
-    if "speech" in t or "address by" in t or "remarks by" in t:
-        return "Speech"
-    return "Other"
+# ---------------- Date parsing ----------------
+_MONTHS = ("january february march april may june july august september october november december").split()
 
-def sentiment_scores(sia, text:str):
-    # VADER prefers shorter text; sample head and tail for long docs
-    chunk = (text[:6000] + "\n" + text[-4000:]) if len(text) > 12000 else text
-    return sia.polarity_scores(chunk)
+def _parse_date_from_text(s: str):
+    if not isinstance(s, str) or not s:
+        return None
+    t = s
+    # YYYY-MM-DD or YYYY/MM/DD
+    m = re.search(r"\b(20\d{2}|19\d{2})[-/](1[0-2]|0?[1-9])[-/](3[01]|[12]?\d)\b", t)
+    if m:
+        y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        return datetime.date(y, mo, d)
+    # D Month YYYY
+    m = re.search(r"\b(3[01]|[12]?\d)\s+(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|"
+                  r"jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|"
+                  r"nov(?:ember)?)\s+(20\d{2}|19\d{2})\b", t, re.I)
+    if m:
+        d = int(m.group(1)); mon = m.group(2).lower(); y = int(m.group(3))
+        mo = [i+1 for i, name in enumerate(_MONTHS) if name.startswith(mon[:3])][0]
+        return datetime.date(y, mo, d)
+    # Month D, YYYY
+    m = re.search(r"\b(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|"
+                  r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?)\s+"
+                  r"(3[01]|[12]?\d),\s*(20\d{2}|19\d{2})\b", t, re.I)
+    if m:
+        mon = m.group(1).lower(); d = int(m.group(2)); y = int(m.group(3))
+        mo = [i+1 for i, name in enumerate(_MONTHS) if name.startswith(mon[:3])][0]
+        return datetime.date(y, mo, d)
+    # Year only
+    m = re.search(r"\b(20\d{2}|19\d{2})\b", t)
+    if m:
+        return datetime.date(int(m.group(1)), 1, 1)
+    return None
 
-def label_from_compound(c: float) -> str:
-    if c >= 0.05: return "Positive"
-    if c <= -0.05: return "Negative"
-    return "Neutral"
+def derive_date(title, filename, text):
+    for field in (title, filename, text):
+        d = _parse_date_from_text(str(field or ""))
+        if d:
+            return d
+    return None
 
-# ---------- Expanded Topics (I–V) ----------
-TOPIC_KEYWORDS = {
-    # I. Thematic Areas (Expanded)
-    "African Standby Force (ASF)": ["african standby force", "asf"],
-    "AU Border Programme (AUBP)": ["au border programme", "aubp"],
-    "African Peace and Security Architecture (APSA)": ["apsa", "african peace and security architecture"],
-    "Disarmament": ["disarmament"],
-    "Early Warning / Conflict Prevention": ["early warning", "conflict prevention", "cews"],
-    "Women and Children in Armed Conflicts": ["women in conflict", "children in armed conflict", "acerwc"],
-    "Youth, Peace and Security (YPS)": ["yps", "youth peace and security"],
-    "Humanitarian Assistance and Disaster Response": ["humanitarian assistance", "disaster response", "relief aid"],
-    "Maritime Security and Safety": ["maritime security", "naval safety", "piracy"],
-    "Cybersecurity / Digital Threats": ["cybersecurity", "digital threats", "cyber attack", "cyber crime"],
-    "Climate Change and Security": ["climate change", "environmental security", "climate security"],
-    "Health Security": ["health security", "pandemic", "epidemic", "biosecurity", "covid"],
-    "Partnerships": ["united nations", "european union", "eu", "ecowas", "sadc", "bilateral", "civil society", "csos"],
-    "Peace Agreements / Mediation Support": ["peace agreement", "ceasefire", "mediation", "negotiation"],
-    "Peacekeeping Operations & Missions": ["peacekeeping", "mission", "operation", "amisom", "atmis", "mnjtf"],
-    "Protection of Civilians (PoC)": ["protection of civilians", "poc"],
-    "Post-Conflict Reconstruction and Development (PCRD)": ["post-conflict reconstruction", "pcrd"],
-    "Security Sector Reform (SSR) / DDR": ["security sector reform", "ssr", "disarmament demobilisation reintegration", "ddr"],
-    "Terrorism and Transnational Organized Crime": ["terrorism", "violent extremism", "organized crime", "boko haram", "al shabaab", "isis"],
-    "Piracy and Illicit Trafficking": ["illicit trafficking", "arms smuggling", "drug trafficking", "human trafficking", "wildlife trafficking"],
-    "Unconstitutional Changes of Government (UCG)": ["unconstitutional change of government", "coup d'etat", "coup d’état", "military takeover"],
-    "Year of Peace / Make Peace Happen Campaign": ["year of peace", "make peace happen"],
-    "African Union High Implementation Panel (AUHIP)": ["auhip", "high implementation panel"],
-    "Democracy / Governance / Elections": ["election", "elections", "governance", "democracy", "referendum"],
-    "Refugees, Returnees & Internally Displaced Persons (IDPs)": ["refugee", "refugees", "internally displaced", "idp", "returnees"],
-    "Apartheid / Decolonization / Self-Determination Issues": ["apartheid", "self-determination", "colonialism", "decolonization", "decolonisation"],
-    "Common African Defence and Security Policy (CADSP)": ["cadsp", "common african defence and security policy"],
-    "Small Arms and Light Weapons (SALW) Control": ["small arms", "light weapons", "salw"],
-    "Nuclear Non-Proliferation and Arms Control": ["nuclear non-proliferation", "arms control", "pelindaba treaty"],
-    "Human Rights and Rule of Law in Conflict Situations": ["human rights", "rule of law", "violations in conflict"],
-    "Cross-Border and Inter-communal Conflicts": ["cross-border conflict", "inter-communal violence", "intercommunal"],
-
-    # II. AU Organs & Structures (Expanded)
-    "Assembly – Heads of State and Government": ["assembly of heads of state", "au assembly"],
-    "Executive Council – Ministers": ["executive council"],
-    "AU Commission (AUC)": ["au commission", "auc"],
-    "Peace and Security Council (PSC)": ["peace and security council", "psc"],
-    "Panel of the Wise": ["panel of the wise"],
-    "CISSA": ["committee of intelligence and security services of africa", "cissa"],
-    "African Court on Human and Peoples’ Rights (AfCHPR)": ["african court on human and peoples’ rights", "afchpr"],
-    "African Commission on Human and Peoples’ Rights (ACHPR)": ["achpr", "african commission on human and peoples’ rights"],
-    "ACERWC": ["acerwc", "committee of experts on the rights and welfare of the child"],
-    "APRM": ["african peer review mechanism", "aprm"],
-    "ECOSOCC": ["economic, social and cultural council", "ecosocc"],
-    "Permanent Representatives’ Committee (PRC)": ["permanent representatives committee", "prc"],
-    "Specialized Technical Committees (STCs)": ["specialized technical committee", "stc"],
-    "African Union Development Agency (AUDA-NEPAD)": ["auda-nepad", "nepad"],
-    "ACSRT (Algiers)": ["african centre for the study and research on terrorism", "acsrt"],
-    "Continental Early Warning System (CEWS)": ["continental early warning system", "cews"],
-    "ASF Regional Brigades": ["east standby brigade", "southern standby brigade", "western standby brigade", "central standby brigade", "north standby brigade"],
-
-    # III. Legal Instruments (Expanded)
-    "Constitutive Act of the AU": ["constitutive act of the african union"],
-    "PSC Protocol": ["protocol relating to the establishment of the peace and security council", "psc protocol"],
-    "Pelindaba Treaty": ["pelindaba treaty", "african nuclear-weapon-free zone treaty"],
-    "Lomé Declaration (2000) on UCG": ["lome declaration", "2000 declaration on unconstitutional changes of government"],
-    "ACDEG (2007)": ["african charter on democracy elections and governance", "acdeg"],
-    "OAU/AU Terrorism Convention (1999) + 2004 Protocol": ["oau convention on the prevention and combating of terrorism", "terrorism protocol"],
-    "AU Non-Aggression and Common Defence Pact (2005)": ["non-aggression and common defence pact"],
-    "OAU Mercenarism Convention (1977)": ["convention for the elimination of mercenarism in africa", "mercenarism convention"],
-    "African Charter on Human and Peoples’ Rights (1981)": ["african charter on human and peoples’ rights"],
-    "African Charter on the Rights and Welfare of the Child (1990)": ["african charter on the rights and welfare of the child"],
-    "AU Refugee Convention (1969)": ["au convention governing specific aspects of refugee problems in africa", "oau refugee convention"],
-    "Kampala Convention (2009) on IDPs": ["kampala convention", "idp convention"],
-    "PCRD Policy Framework (2006)": ["policy framework on post-conflict reconstruction and development", "pcrd framework"],
-    "CADSP (2004)": ["common african defence and security policy"],
-
-    # IV. Regional Economic Communities (RECs)
-    "CEN-SAD": ["cen-sad", "community of sahel-saharan states"],
-    "ECCAS": ["eccas", "economic community of central african states"],
-    "COMESA": ["comesa", "common market for eastern and southern africa"],
-    "ECOWAS": ["ecowas", "economic community of west african states"],
-    "IGAD": ["igad", "intergovernmental authority on development"],
-    "SADC": ["sadc", "southern african development community"],
-   "UMA": ["uma", "arab maghreb union"],
-}  # <-- Close the dictionary here
-
-# IV. Regional Economic Communities (RECs)
-TOPIC_KEYWORDS.update({
-    "CEN-SAD": ["cen-sad", "community of sahel-saharan states"],
-    "ECCAS": ["eccas", "economic community of central african states"],
-    "COMESA": ["comesa", "common market for eastern and southern africa"],
-    "ECOWAS": ["ecowas", "economic community of west african states"],
-    "IGAD": ["igad", "intergovernmental authority on development"],
-    "SADC": ["sadc", "southern african development community"],
-    "UMA": ["uma", "arab maghreb union"],
-})
-
-# V. AU Member States (55) + SADR
-TOPIC_KEYWORDS.update({
-    # North Africa (6) + SADR
-    "Algeria": ["algeria", "algiers"],
-    "Egypt": ["egypt", "cairo"],
-    "Libya": ["libya", "tripoli", "benghazi"],
-    "Mauritania": ["mauritania", "nouakchott"],
-    "Morocco": ["morocco", "rabat", "western sahara"],
-    "Tunisia": ["tunisia", "tunis"],
-    "Sahrawi Arab Democratic Republic (SADR)": ["sadr", "sahrawi", "western sahara"],
-
+# ---------------- Country & Region mapping ----------------
+COUNTRIES = [
+    # North Africa (6 + SADR)
+    "Algeria","Egypt","Libya","Mauritania","Morocco","Tunisia",
+    "Sahrawi Arab Democratic Republic (SADR)",
     # West Africa (15)
-    "Benin": ["benin", "porto-novo", "cotonou"],
-    "Burkina Faso": ["burkina faso", "ouagadougou"],
-    "Cabo Verde": ["cabo verde", "cape verde", "praia"],
-    "Côte d’Ivoire": ["cote d’ivoire", "ivory coast", "abidjan", "yamoussoukro", "yamoussukro"],
-    "Gambia": ["gambia", "banjul"],
-    "Ghana": ["ghana", "accra"],
-    "Guinea": ["guinea", "conakry"],
-    "Guinea-Bissau": ["guinea-bissau", "bissau"],
-    "Liberia": ["liberia", "monrovia"],
-    "Mali": ["mali", "bamako"],
-    "Niger": ["niger", "niamey"],
-    "Nigeria": ["nigeria", "abuja", "lagos"],
-    "Senegal": ["senegal", "dakar"],
-    "Sierra Leone": ["sierra leone", "freetown"],
-    "Togo": ["togo", "lomé", "lome"],
-
+    "Benin","Burkina Faso","Cabo Verde","Côte d’Ivoire","Gambia","Ghana","Guinea",
+    "Guinea-Bissau","Liberia","Mali","Niger","Nigeria","Senegal","Sierra Leone","Togo",
     # Central Africa (9)
-    "Burundi": ["burundi", "bujumbura", "gitega"],
-    "Cameroon": ["cameroon", "yaoundé", "yaounde", "douala"],
-    "Central African Republic": ["central african republic", "car", "bangui"],
-    "Chad": ["chad", "ndjamena", "n’djamena", "n'djamena"],
-    "Congo (Republic)": ["republic of the congo", "congo-brazzaville", "brazzaville"],
-    "Democratic Republic of Congo (DRC)": ["democratic republic of congo", "drc", "kinshasa", "goma"],
-    "Equatorial Guinea": ["equatorial guinea", "malabo"],
-    "Gabon": ["gabon", "libreville"],
-    "São Tomé and Príncipe": ["sao tome", "são tomé", "principe", "sao tome and principe", "são tomé and príncipe"],
-
+    "Burundi","Cameroon","Central African Republic","Chad","Congo (Republic)",
+    "Democratic Republic of Congo (DRC)","Equatorial Guinea","Gabon","São Tomé and Príncipe",
     # East Africa (14)
-    "Comoros": ["comoros", "moroni"],
-    "Djibouti": ["djibouti"],
-    "Eritrea": ["eritrea", "asmara"],
-    "Ethiopia": ["ethiopia", "addis ababa"],
-    "Kenya": ["kenya", "nairobi", "mombasa"],
-    "Madagascar": ["madagascar", "antananarivo"],
-    "Mauritius": ["mauritius", "port louis"],
-    "Rwanda": ["rwanda", "kigali"],
-    "Seychelles": ["seychelles", "victoria"],
-    "Somalia": ["somalia", "mogadishu"],
-    "South Sudan": ["south sudan", "juba"],
-    "Sudan": ["sudan", "khartoum", "darfur"],
-    "Tanzania": ["tanzania", "dodoma", "dar es salaam"],
-    "Uganda": ["uganda", "kampala"],
-
+    "Comoros","Djibouti","Eritrea","Ethiopia","Kenya","Madagascar","Mauritius","Rwanda",
+    "Seychelles","Somalia","South Sudan","Sudan","Tanzania","Uganda",
     # Southern Africa (11)
-    "Angola": ["angola", "luanda"],
-    "Botswana": ["botswana", "gaborone"],
-    "Eswatini": ["eswatini", "swaziland", "mbabane", "lobamba"],
-    "Lesotho": ["lesotho", "maseru"],
-    "Malawi": ["malawi", "lilongwe", "blantyre"],
-    "Mozambique": ["mozambique", "maputo"],
-    "Namibia": ["namibia", "windhoek"],
-    "South Africa": ["south africa", "pretoria", "johannesburg", "cape town", "durban"],
-    "Zambia": ["zambia", "lusaka"],
-    "Zimbabwe": ["zimbabwe", "harare", "bulawayo"],
-})
-
-# ---------------------------
-# Regions for AU Member States
-# ---------------------------
-COUNTRY_TO_REGION = {
-    # North Africa (6)
-    "Algeria": "North Africa",
-    "Egypt": "North Africa",
-    "Libya": "North Africa",
-    "Mauritania": "North Africa",
-    "Morocco": "North Africa",
-    "Tunisia": "North Africa",
-    # Western Sahara / SADR
-    "Sahrawi Arab Democratic Republic (SADR)": "North Africa",
-
-    # West Africa (15)
-    "Benin": "West Africa",
-    "Burkina Faso": "West Africa",
-    "Cabo Verde": "West Africa",
-    "Côte d’Ivoire": "West Africa",
-    "Gambia": "West Africa",
-    "Ghana": "West Africa",
-    "Guinea": "West Africa",
-    "Guinea-Bissau": "West Africa",
-    "Liberia": "West Africa",
-    "Mali": "West Africa",
-    "Niger": "West Africa",
-    "Nigeria": "West Africa",
-    "Senegal": "West Africa",
-    "Sierra Leone": "West Africa",
-    "Togo": "West Africa",
-
-    # Central Africa (9)
-    "Burundi": "Central Africa",
-    "Cameroon": "Central Africa",
-    "Central African Republic": "Central Africa",
-    "Chad": "Central Africa",
-    "Congo (Republic)": "Central Africa",
-    "Democratic Republic of Congo (DRC)": "Central Africa",
-    "Equatorial Guinea": "Central Africa",
-    "Gabon": "Central Africa",
-    "São Tomé and Príncipe": "Central Africa",
-
-    # East Africa (14)
-    "Comoros": "East Africa",
-    "Djibouti": "East Africa",
-    "Eritrea": "East Africa",
-    "Ethiopia": "East Africa",
-    "Kenya": "East Africa",
-    "Madagascar": "East Africa",
-    "Mauritius": "East Africa",
-    "Rwanda": "East Africa",
-    "Seychelles": "East Africa",
-    "Somalia": "East Africa",
-    "South Sudan": "East Africa",
-    "Sudan": "East Africa",
-    "Tanzania": "East Africa",
-    "Uganda": "East Africa",
-
-    # Southern Africa (11)
-    "Angola": "Southern Africa",
-    "Botswana": "Southern Africa",
-    "Eswatini": "Southern Africa",
-    "Lesotho": "Southern Africa",
-    "Malawi": "Southern Africa",
-    "Mozambique": "Southern Africa",
-    "Namibia": "Southern Africa",
-    "South Africa": "Southern Africa",
-    "Zambia": "Southern Africa",
-    "Zimbabwe": "Southern Africa",
+    "Angola","Botswana","Eswatini","Lesotho","Malawi","Mozambique","Namibia",
+    "South Africa","Zambia","Zimbabwe",
+]
+REGION_OF = {
+    # North
+    "Algeria":"North Africa","Egypt":"North Africa","Libya":"North Africa","Mauritania":"North Africa",
+    "Morocco":"North Africa","Tunisia":"North Africa","Sahrawi Arab Democratic Republic (SADR)":"North Africa",
+    # West
+    "Benin":"West Africa","Burkina Faso":"West Africa","Cabo Verde":"West Africa","Côte d’Ivoire":"West Africa",
+    "Gambia":"West Africa","Ghana":"West Africa","Guinea":"West Africa","Guinea-Bissau":"West Africa",
+    "Liberia":"West Africa","Mali":"West Africa","Niger":"West Africa","Nigeria":"West Africa",
+    "Senegal":"West Africa","Sierra Leone":"West Africa","Togo":"West Africa",
+    # Central
+    "Burundi":"Central Africa","Cameroon":"Central Africa","Central African Republic":"Central Africa",
+    "Chad":"Central Africa","Congo (Republic)":"Central Africa","Democratic Republic of Congo (DRC)":"Central Africa",
+    "Equatorial Guinea":"Central Africa","Gabon":"Central Africa","São Tomé and Príncipe":"Central Africa",
+    # East
+    "Comoros":"East Africa","Djibouti":"East Africa","Eritrea":"East Africa","Ethiopia":"East Africa",
+    "Kenya":"East Africa","Madagascar":"East Africa","Mauritius":"East Africa","Rwanda":"East Africa",
+    "Seychelles":"East Africa","Somalia":"East Africa","South Sudan":"East Africa","Sudan":"East Africa",
+    "Tanzania":"East Africa","Uganda":"East Africa",
+    # Southern
+    "Angola":"Southern Africa","Botswana":"Southern Africa","Eswatini":"Southern Africa","Lesotho":"Southern Africa",
+    "Malawi":"Southern Africa","Mozambique":"Southern Africa","Namibia":"Southern Africa",
+    "South Africa":"Southern Africa","Zambia":"Southern Africa","Zimbabwe":"Southern Africa",
+}
+ALIASES = {
+    "Côte d’Ivoire": ["cote d’ivoire","cote d'ivoire","ivory coast"],
+    "Democratic Republic of Congo (DRC)": [  # English variants
+        "democratic republic of congo",
+        "democratic republic of the congo",
+        "democratic republic of congo (drc)",
+        "democratic republic of the congo (drc)",
+        "dr congo",
+        "dr of congo",
+        "congo-kinshasa",
+        "drc",
+        # French variants
+        "republique democratique du congo",
+        "république démocratique du congo",
+        "rep. dem. du congo",
+        "rdc"],
+    "Congo (Republic)": ["republic of the congo","congo-brazzaville"],
+    "Eswatini": ["swaziland"],
+    "São Tomé and Príncipe": ["sao tome and principe","sao tome","são tomé","sao tomé","sao tome & principe"],
+    "Sahrawi Arab Democratic Republic (SADR)": ["sadr","sahrawi","western sahara"],
+    "Gambia": ["the gambia"],
 }
 
+def _alias_to_regex(alias: str) -> re.Pattern:
+    a = _norm(alias)
+    a = re.sub(r"\s+", r"\\s+", re.escape(a))   # collapse whitespace
+    a = a.replace("\\-", "[-\\s]?")             # hyphen or space
+    return re.compile(rf"(?<!\w){a}(?!\w)", re.IGNORECASE)
 
-def detect_topic(text:str) -> str:
-    t = text.lower()
-    best_topic, best_hits = "General", 0
-    for topic, keys in TOPIC_KEYWORDS.items():
-        hits = sum(t.count(k) for k in keys)
-        if hits > best_hits:
-            best_topic, best_hits = topic, hits
-    return best_topic
+COUNTRY_PATTERNS = {}
+for c in COUNTRIES:
+    pats = [_alias_to_regex(c)]
+    for alt in ALIASES.get(c, []):
+        pats.append(_alias_to_regex(alt))
+    COUNTRY_PATTERNS[c] = pats
 
-def topic_to_region(topic: str) -> str:
-    return COUNTRY_TO_REGION.get(topic, "Non-country/Other")
+def extract_countries_from_text(title: str, text: str):
+    blob = _norm(f"{title or ''} {text or ''}")
+    hits = set()
+    for country, pats in COUNTRY_PATTERNS.items():
+        if any(p.search(blob) for p in pats):
+            hits.add(country)
+    return sorted(hits)
 
-# ---------- Main pipeline ----------
-def run(manifest_path:str, limit:int=None):
-    df = pd.read_csv(manifest_path)
-    if limit:
-        df = df.head(limit).copy()
+def region_from_countries(countries):
+    if not countries:
+        return "Non-country/Other"
+    regs = {REGION_OF.get(c) for c in countries if REGION_OF.get(c)}
+    if not regs:
+        return "Non-country/Other"
+    return regs.pop() if len(regs) == 1 else "Multi-Region"
 
-    texts, types, topics, sent_compound, sent_label = [], [], [], [], []
-    sia = SentimentIntensityAnalyzer()
+# ---------------- Topic dictionaries ----------------
+THEMATIC = {
+    "African Standby Force (ASF)": [r"\bafrican standby force\b", r"\basf\b"],
+    "APSA / Peace Architecture": [r"\bapsa\b", r"\bpeace and security architecture\b"],
+    "Disarmament / DDR / SSR": [r"\bddr\b", r"\bdisarmament\b", r"\bsecurity sector reform\b", r"\bssr\b"],
+    "Early Warning / CEWS": [r"\bearly warning\b", r"\bcews\b"],
+    "Women/Children in Armed Conflict": [r"\bwomen\b.*\barme?d conflict\b", r"\bchildren in armed conflict\b"],
+    "Youth, Peace & Security (YPS)": [r"\byouth(,|\s) peace(,|\s) and security\b", r"\byps\b"],
+    "Humanitarian / Disaster Response": [r"\bhumanitarian\b", r"\bdisaster response\b"],
+    "Maritime Security": [r"\bmaritime security\b", r"\bpiracy\b"],
+    "Cybersecurity / Digital": [r"\bcyber(security| ?crime| ?attack)s?\b", r"\bdigital\b"],
+    "Climate & Security": [r"\bclimate (change|security)\b", r"\benvironmental security\b"],
+    "Health Security": [r"\bpandemic(s)?\b", r"\bepidemic(s)?\b", r"\bbiosecurity\b"],
+    "Terrorism / TOC": [r"\bterroris(m|t)s?\b", r"\btransnational organized crime\b", r"\bviolent extremis(m|t)s?\b"],
+    "PCRD": [r"\bpost-?conflict reconstruction\b", r"\bpcrd\b"],
+    "PoC / Protection of Civilians": [r"\bprotection of civilians\b", r"\bpoc\b"],
+    "UCG / Coups": [r"\bunconstitutional changes of government\b", r"\bucg\b", r"\bcoup(s)?\b"],
+}
+ORGANS = {
+    "Peace and Security Council (PSC)": [r"\bpeace and security council\b", r"\bpsc\b"],
+    "AU Commission (AUC)": [r"\bau commission\b", r"\bauc\b"],
+    "Panel of the Wise": [r"\bpanel of the wise\b"],
+    "ACSRT (Algiers)": [r"\bacsrt\b", r"\bafrican centre for the study and research on terrorism\b"],
+    "CEWS": [r"\bcews\b", r"\bcontinental early warning system\b"],
+}
+INSTRUMENTS = {
+    "PSC Protocol": [r"\bprotocol relating to the establishment of the peace and security council\b", r"\bpsc protocol\b"],
+    "ACDEG (2007)": [r"\bcharter on democracy, elections and governance\b", r"\bacdeg\b"],
+    "Lomé Declaration (2000)": [r"\blom[eé] declaration\b"],
+    "Pelindaba Treaty": [r"\bafrican nuclear-weapon-free zone\b", r"\bpelindaba\b"],
+    "Kampala Convention (2009)": [r"\bkampala convention\b"],
+}
+RECS = {
+    "ECOWAS": [r"\becowas\b"],
+    "SADC": [r"\bsadc\b"],
+    "IGAD": [r"\bigad\b"],
+    "ECCAS": [r"\beccas\b"],
+    "COMESA": [r"\bcomesa\b"],
+    "CEN-SAD": [r"\bcen-?sad\b"],
+    "UMA / AMU": [r"\b(uma|amu|arab maghreb union)\b"],
+}
 
-    for _, row in tqdm(df.iterrows(), total=len(df), desc="Analyze PDFs"):
-        path = row["path"]
+def _match_any(dct, blob):
+    hits = []
+    for label, patterns in dct.items():
+        for p in patterns:
+            if re.search(p, blob):
+                hits.append(label); break
+    return hits
+
+def detect_topics(title: str, text: str, countries):
+    # Prefer country topics when present
+    blob = _norm(f"{title or ''} {text or ''}")
+    if countries:
+        if len(countries) == 1:
+            return countries[0], "Country"
+        return "Multi-country", "Country"
+    # Else fall back to other taxonomies
+    for dct, src in ((THEMATIC,"Thematic"), (ORGANS,"Organ"), (INSTRUMENTS,"Instrument"), (RECS,"REC")):
+        hits = _match_any(dct, blob)
+        if hits:
+            return hits[0], src
+    return "Other/General", "Other"
+
+# ---------------- Doc type heuristics ----------------
+def guess_doc_type(title: str, filename: str, text: str):
+    blob = _norm(" ".join([title or "", filename or "", text or ""]))
+    if re.search(r"\bcommuniqu[eé]\b", blob) or re.search(r"\b\.comm[-_.](en|fr)\.pdf$", (filename or "").lower()):
+        return "Communiqué"
+    if re.search(r"\bpress (statement|release)\b", blob):
+        return "Press Statement"
+    if re.search(r"\breport\b", blob):
+        return "Report"
+    if re.search(r"\bspeech|remarks|address\b", blob):
+        return "Speech"
+    if re.search(r"\bdecision|declaration\b", blob):
+        return "Decision/Declaration"
+    return "Other"
+
+# ---------------- Sentiment (VADER) ----------------
+_SIA = None
+def _get_sia():
+    global _SIA
+    if _SIA is None:
         try:
-            text = pdf_to_text(path)
-        except Exception as e:
-            print(f"[WARN] Could not read {path}: {e}")
-            text = ""
+            from nltk.sentiment import SentimentIntensityAnalyzer  # noqa
+        except Exception:
+            import nltk
+            nltk.download("vader_lexicon")
+        from nltk.sentiment import SentimentIntensityAnalyzer
+        _SIA = SentimentIntensityAnalyzer()
+    return _SIA
 
-        doc_type = classify_type(row.get("title",""), row.get("filename",""), text)
-        topic = detect_topic(text)
-        scores = sentiment_scores(sia, text)
-        compound = scores["compound"]
-        label = label_from_compound(compound)
+def sentiment_scores(text: str):
+    sia = _get_sia()
+    t = text or ""
+    head = t[:4000]; tail = t[-3000:] if len(t) > 7000 else ""
+    s = sia.polarity_scores(head + "\n" + tail)
+    comp = s.get("compound", 0.0)
+    if comp >= 0.05: label = "Positive"
+    elif comp <= -0.05: label = "Negative"
+    else: label = "Neutral"
+    return comp, label
 
-        texts.append(text)
-        types.append(doc_type)
-        topics.append(topic)
-        sent_compound.append(compound)
-        sent_label.append(label)
+# ---------------- 4-level Diplomatic Intent ----------------
+INTENT_LEXICON = {
+    "Assertive / Binding": [
+        r"\bdecide(s|d|ing)?\b", r"\bauthori[sz]e(s|d|ing)?\b", r"\bcondemn(s|ed|ing)?\b",
+        r"\bdirect(s|ed|ing)?\b", r"\bmandate(s|d|ing)?\b", r"\bimpos(e|es|ed|ing)\b.*\bsanction(s)?\b",
+        r"\bsanction(s|ed|ing)?\b", r"\bsuspend(s|ed|ing)?\b", r"\breject(s|ed|ing)?\b",
+        r"\bdemand(s|ed|ing)?\b", r"\border(s|ed|ing)?\b", r"\badopt(s|ed|ing)?\b",
+        r"\bendorse(s|d|ing)?\b", r"\bapprove(s|d|ing)?\b",
+    ],
+    "Advisory / Urging": [
+        r"\bcall(s|ed|ing)?\s+(upon|on|for)\b", r"\burge(s|d|ing)?\b", r"\bencourage(s|d|ing)?\b",
+        r"\brequest(s|ed|ing)?\b", r"\bappeal(s|ed|ing)?\s+(to|for)\b", r"\binvite(s|d|ing)?\b",
+        r"\brecommend(s|ed|ing)?\b", r"\bshould\b", r"\bpress(es|ed|ing)?\b",
+    ],
+    "Supportive / Commendatory": [
+        r"\bwelcom(e|es|ed|ing)\b", r"\bcommend(s|ed|ing)?\b", r"\bappreciate(s|d|ing)?\b", r"\bsupport(s|ed|ing)?\b",
+        r"\bapplaud(s|ed|ing)?\b", r"\bpraise(s|d|ing)?\b", r"\bcongratulate(s|d|ing)?\b",
+        r"\brecognis(e|es|ed|ing)\b|\brecogniz(e|es|ed|ing)\b", r"\bnote(s|d)?\s+with\s+appreciation\b",
+    ],
+    "Procedural / Neutral": [
+        r"\brecall(s|ed|ing)?\b", r"\breaffirm(s|ed|ing)?\b", r"\breiterate(s|d|ing)?\b",
+        r"\bnote(s|d|ing)?\b", r"\btake(s|n)?\s+note\b", r"\bconsider(s|ed|ing)?\b", r"\bconsidering\b",
+        r"\b(decide(s|d)?\s+to\s+)?remain(s|ed|ing)?\s+seized(\s+of\s+the\s+matter)?\b",
+        r"\bpursuant\s+to\b", r"\bin\s+accordance\s+with\b", r"\bguided\s+by\b", r"\bmindful\s+of\b",
+        r"\bunderline(s|d|ing)?\b", r"\bemphasise?s?\b", r"\baffirm(s|ed|ing)?\b",
+    ],
+}
+INTENT_ORDER = [
+    "Assertive / Binding","Advisory / Urging","Supportive / Commendatory","Procedural / Neutral","Other/General"
+]
+PROCEDURAL_OVERRIDE = re.compile(
+    r"\b(decide(s|d)?\s+to\s+)?remain(s|ed|ing)?\s+seized(\s+of\s+the\s+matter)?\b", re.IGNORECASE
+)
 
-    df["text"] = texts
-    df["doc_type"] = types
-    df["topic"] = topics
-    df["sent_compound"] = sent_compound
-    df["sent_label"] = sent_label
+def intent_from_text(text: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        return "Other/General"
+    t = text.lower()
+    if PROCEDURAL_OVERRIDE.search(t):
+        return "Procedural / Neutral"
+    scores = {cat: 0 for cat in INTENT_LEXICON}
+    for cat, pats in INTENT_LEXICON.items():
+        scores[cat] = sum(len(re.findall(p, t)) for p in pats)
+    if not any(scores.values()):
+        return "Other/General"
+    best = max(scores.items(), key=lambda kv: (kv[1], -INTENT_ORDER.index(kv[0])))
+    return best[0]
 
-    # Region from topic (if the topic is a country)
-    df["region"] = df["topic"].apply(topic_to_region)
+# ---------------- PSC flag ----------------
+def is_psc_communique(doc_type: str, title: str, text: str):
+    if (doc_type or "").lower() != "communiqué":
+        return False
+    blob = _norm(f"{title or ''} {text or ''}")
+    return ("peace and security council" in blob) or (re.search(r"\bpsc\b", blob) is not None)
 
-    ensure_dir("data")
-    out_csv = "data/analysis.csv"
-    df.to_csv(out_csv, index=False, encoding="utf-8")
-    print(f"[DONE] Analysis saved to {out_csv}")
+# ---------------- Chart helpers ----------------
+def bar_save(series, title, out_path, xlabel="", ylabel="Count", colors_cfg=None, cmap_key=None):
+    ensure_dir(os.path.dirname(out_path))
+    plt.figure()
+    colors = _color_list(series.index.tolist(), (colors_cfg or {}).get(cmap_key or "", {}), (colors_cfg or {}).get("palette", []))
+    series.plot(kind="bar", color=colors)
+    plt.title(title); plt.xlabel(xlabel); plt.ylabel(ylabel)
+    plt.tight_layout(); plt.savefig(out_path, dpi=160); plt.close()
 
-    # ----- Charts -----
-    ensure_dir(os.path.join("output", "charts"))
+def stacked_save(df_wide, title, out_path, xlabel="", ylabel="Count", colors_cfg=None, cmap_key=None):
+    ensure_dir(os.path.dirname(out_path))
+    plt.figure()
+    cols = df_wide.columns.tolist()
+    colors = _color_list(cols, (colors_cfg or {}).get(cmap_key or "", {}), (colors_cfg or {}).get("palette", []))
+    df_wide.plot(kind="bar", stacked=True, color=colors)
+    plt.title(title); plt.xlabel(xlabel); plt.ylabel(ylabel)
+    plt.tight_layout(); plt.savefig(out_path, dpi=160); plt.close()
 
-    type_counts = df["doc_type"].value_counts()
-    bar_save(type_counts, "Documents by Type", "Type", "Count",
-             os.path.join("output", "charts", "doc_types.png"))
+def hist_save(series, title, out_path, bins=30, xlabel="Score"):
+    ensure_dir(os.path.dirname(out_path))
+    plt.figure()
+    plt.hist(series.dropna(), bins=bins)
+    plt.title(title); plt.xlabel(xlabel); plt.ylabel("Frequency")
+    plt.tight_layout(); plt.savefig(out_path, dpi=160); plt.close()
 
-    label_counts = df["sent_label"].value_counts()
-    bar_save(label_counts, "Sentiment Labels", "Label", "Count",
-             os.path.join("output", "charts", "sentiment_labels.png"))
+# ---------------- Main ----------------
+def main(manifest="data/manifest.csv", analysis_csv="data/analysis.csv", outdir="output/charts",
+         limit=0, colors_file=None, count_first_page=False):
+    colors_cfg = load_colors(colors_file)
 
-    hist_save(df["sent_compound"], bins=21,
-              title="Sentiment (VADER Compound)", xlabel="Compound Score",
-              out_path=os.path.join("output", "charts", "sentiment_hist.png"))
+    if not os.path.exists(manifest):
+        raise SystemExit(f"Manifest not found: {manifest}")
+    man = pd.read_csv(manifest)
+    if limit and limit > 0:
+        man = man.head(limit)
 
-    # Topics (top 20)
-    topic_counts = df["topic"].value_counts().head(20)
-    bar_save(topic_counts, "Top 20 Topics", "Topic", "Count",
-             os.path.join("output", "charts", "topics_top20.png"))
+    rows = []
+    for _, r in man.iterrows():
+        path = r.get("path") or os.path.join("data","pdfs", r.get("filename",""))
+        title = str(r.get("title",""))
+        filename = str(r.get("filename",""))
+        url = str(r.get("url","") or r.get("pdf_url",""))
 
-    # Regions
-    region_counts = df["region"].value_counts()
-    bar_save(region_counts, "Documents by Region", "Region", "Count",
-             os.path.join("output", "charts", "regions.png"))
+        pages = extract_text_pages(path)
+        full_text = "\n\n".join(pages).strip()
+        text_no_p1 = "\n\n".join(pages[1:]).strip() if len(pages) > 1 else ""
+        country_scope_text = full_text if count_first_page else text_no_p1
 
-    # Region × Sentiment (stacked)
-    pivot_rs = pd.crosstab(df["region"], df["sent_label"]).reindex(
-        ["North Africa", "West Africa", "Central Africa", "East Africa", "Southern Africa", "Non-country/Other"],
-        fill_value=0
-    )
-    bar_save(pivot_rs, "Documents by Region and Sentiment", "Region", "Count",
-             os.path.join("output", "charts", "regions_sentiment_stacked.png"),
-             stacked=True)
+        doc_type = guess_doc_type(title, filename, full_text)
+        countries = extract_countries_from_text(title, country_scope_text)
+        region = region_from_countries(countries)
+        topic, topic_src = detect_topics(title, full_text, countries)
+        sent_comp, sent_label = sentiment_scores(full_text)
+        intent4 = intent_from_text(full_text)
+        date_val = derive_date(title, filename, full_text)
+        psc_flag = is_psc_communique(doc_type, title, full_text)
+
+        rows.append({
+            "title": title,
+            "filename": filename,
+            "url": url,
+            "path": str(path).replace("\\","/"),
+            "doc_type": doc_type,
+            "text": full_text,
+            "topic": topic,
+            "topic_source": topic_src,
+            "countries_str": "; ".join(countries),
+            "region": region,
+            "sent_compound": sent_comp,
+            "sent_label": sent_label,
+            "intent4": intent4,
+            "date": date_val.isoformat() if date_val else "",
+            "psc_flag": bool(psc_flag),
+            "size_bytes": int(r.get("size_bytes", 0)),
+            "pages_count": len(pages),
+            "countries_count_scope": "full" if count_first_page else "no_first_page"
+        })
+
+    # Save analysis CSV
+    ensure_dir(os.path.dirname(analysis_csv) or ".")
+    df = pd.DataFrame(rows)
+    df.to_csv(analysis_csv, index=False, encoding="utf-8")
+    print(f"[DATA] Wrote {analysis_csv} ({len(df)} rows)")
+
+    # ---- Charts ----
+    ensure_dir(outdir)
+
+    # 1) Doc types
+    if "doc_type" in df.columns:
+        c = df["doc_type"].value_counts()
+        bar_save(c, "Documents by Type", os.path.join(outdir, "doc_types.png"),
+                 colors_cfg=colors_cfg, cmap_key="doc_types")
+
+    # 2) Sentiment labels
+    if "sent_label" in df.columns:
+        c = df["sent_label"].value_counts()
+        bar_save(c, "Sentiment Labels", os.path.join(outdir, "sentiment_labels.png"),
+                 colors_cfg=colors_cfg, cmap_key="tone")
+
+    # 3) Sentiment histogram
+    if "sent_compound" in df.columns:
+        hist_save(df["sent_compound"], "Sentiment (VADER compound)",
+                  os.path.join(outdir, "sentiment_hist.png"))
+
+    # 4) Topics (Top 20)
+    if "topic" in df.columns:
+        top = df["topic"].value_counts().head(20)
+        bar_save(top, "Top 20 Topics", os.path.join(outdir, "topics_top20.png"),
+                 colors_cfg=colors_cfg, cmap_key="topics")
+
+    # 5) Region counts
+    if "region" in df.columns:
+        reg = df["region"].value_counts()
+        bar_save(reg, "Documents by Region", os.path.join(outdir, "regions.png"),
+                 colors_cfg=colors_cfg, cmap_key="regions")
+
+    # 6) Region × Sentiment (stacked)
+    if {"region","sent_label"}.issubset(df.columns):
+        pivot = (df.pivot_table(index="region", columns="sent_label", values="title", aggfunc="count")
+                   .fillna(0)
+                   .loc[lambda x: x.sum(axis=1) > 0])
+        pivot = pivot.loc[pivot.sum(axis=1).sort_values(ascending=False).index]
+        stacked_save(pivot, "Documents by Region × Sentiment",
+                     os.path.join(outdir, "regions_sentiment_stacked.png"),
+                     xlabel="Region", colors_cfg=colors_cfg, cmap_key="tone")
+
+    # 7) PSC-only quick counts (intent 4-level)
+    df_psc = df[df.get("psc_flag", False) == True]
+    if not df_psc.empty:
+        order = ["Assertive / Binding","Advisory / Urging","Supportive / Commendatory","Procedural / Neutral","Other/General"]
+        c = df_psc["intent4"].value_counts().reindex(order, fill_value=0)
+        bar_save(c, "PSC Communiqués — Diplomatic Intent (4 levels)",
+                 os.path.join(outdir, "psc_intent4_counts.png"),
+                 colors_cfg=colors_cfg, cmap_key="intent")
+
+    print(f"[DONE] Charts saved to: {outdir}")
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--manifest", default="data/psc_2025_en/psc_communiques_2025_manifest.csv")
-    ap.add_argument("--limit", type=int, default=None)
+    ap = argparse.ArgumentParser(description="Analyze AU/PSC PDFs -> CSV + charts")
+    ap.add_argument("--manifest", default="data/manifest.csv", help="Input manifest (CSV) from au_scrape.py")
+    ap.add_argument("--analysis-csv", default="data/analysis.csv", help="Output analysis CSV path")
+    ap.add_argument("--outdir", default="output/charts", help="Charts output directory")
+    ap.add_argument("--limit", type=int, default=0, help="Only process first N manifest rows (testing)")
+    ap.add_argument("--colors-file", default="chart_colors.json", help="Optional colors config")
+    ap.add_argument("--count-first-page", action="store_true",
+                    help="Include page 1 when detecting countries (default: exclude)")
     args = ap.parse_args()
-    run(args.manifest, args.limit)
-    
+    main(args.manifest, args.analysis_csv, args.outdir, args.limit, args.colors_file, args.count_first_page)

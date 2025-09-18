@@ -7,6 +7,16 @@
     "#e69f00", 
     "#ff898a"   
   ],
+    "crises": {
+    "Sudan": "#ff898a",
+    "South Sudan": "#e69f00",
+    "Somalia": "#56b4e9",
+    "Mali": "#87ceeb",
+    "Democratic Republic of Congo (DRC)": "#ff6f61",
+    "Niger": "#f0e442",
+    "Libya": "#009e73",
+    "Ethiopia": "#9fd3f6"
+  },
 
   "verbs_palette_strong": [
     "#ff898a",

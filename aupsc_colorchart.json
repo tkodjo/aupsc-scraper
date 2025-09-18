@@ -1,0 +1,24 @@
+{
+  "intent": {
+    "Assertive / Binding": "#ff898a",
+    "Advisory / Urging": "#f0e442",
+    "Supportive / Commendatory": "#009e73",
+    "Procedural / Neutral": "#87ceeb",
+    "Other/General": "#bdbdbd"
+  },
+  "verbs": {},
+  "palette": [
+    "#56b4e9",
+    "#e69f00",
+    "#cc79a7",
+    "#b3de69",
+    "#80b1d3",
+    "#fdb462",
+    "#bc80bd",
+    "#ccebc5",
+    "#ffed6f",
+    "#bebada",
+    "#8dd3c7",
+    "#fdae6b"
+  ]
+}

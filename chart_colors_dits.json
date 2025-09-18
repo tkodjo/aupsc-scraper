@@ -1,0 +1,75 @@
+{
+  "palette": [
+    "#87ceeb",
+    "#56b4e9",
+    "#f0e442",
+    "#009e73",
+    "#e69f00",
+    "#ff898a"
+  ],
+  "verbs_palette_strong": [
+    "#ff898a",
+    "#ff9da7",
+    "#ffb3ba",
+    "#ff6f61",
+    "#ff7f7f"
+  ],
+  "tone": {
+    "Positive": "#009e73",
+    "Neutral": "#f0e442",
+    "Negative": "#ff898a"
+  },
+  "intent": {
+    "Assertive / Binding": "#ff898a",
+    "Advisory / Urging": "#F0E442",
+    "Supportive / Commendatory": "#009e73",
+    "Procedural / Neutral": "#56b4e9",
+    "Other/General": "#dcdcdc"
+  },
+  "verbs": {
+    "condemn": "#ff898a",
+    "denounce": "#ff898a",
+    "deplore": "#ff898a",
+    "sanction": "#ff898a",
+    "suspend": "#ff898a",
+    "reject": "#ff898a",
+    "warn": "#ff898a",
+    "demand": "#ff898a",
+
+    "call": "#87ceeb",
+    "urge": "#87ceeb",
+    "request": "#87ceeb",
+    "appeal": "#87ceeb",
+    "invite": "#87ceeb",
+    "encourage": "#87ceeb",
+    "press": "#87ceeb",
+
+    "decide": "#f0e442",
+    "authorize": "#56b4e9",
+    "adopt": "#f0e442",
+    "approve": "#009e73",
+    "endorse": "#56b4e9",
+    "direct": "#56b4e9",
+    "mandate": "#87ceeb",
+
+    "deploy": "#009e73",
+    "support": "#009e73",
+    "assist": "#009e73",
+
+    "welcome": "#009e73",
+    "commend": "#56b4e9",
+    "express": "#56b4e9",
+    "reiterate": "#56b4e9",
+    "reaffirm": "#56b4e9",
+    "recall": "#f0e442",
+    "emphasize": "#56b4e9",
+    "underline": "#56b4e9",
+    "affirm": "#56b4e9",
+    "congratulate": "#009e73",
+    "recognize": "#56b4e9",
+    "praise": "#009e73",
+    "applaud": "#009e73",
+    "note": "#f0e442",
+    "take_note": "#f0e442"
+  }
+}
